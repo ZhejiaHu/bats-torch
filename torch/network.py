@@ -38,8 +38,8 @@ class LIF_Layer(nn.Module):
 
 class MNIST_Network(nn.Module):
     @staticmethod
-    def _layer_config(params: pd.DataFrame, layer_idx: int) -> Dict:
-        return {col + f"__{layer_idx}": params.loc[layer_idx, col] for col in params.columns}
+    def _layer_config(params: pd.DataFrame, layer_idx: int, add_idx: bool=True) -> Dict:
+        return {col + (f"__{layer_idx}" if add_idx else ""): params.loc[layer_idx, col] for col in params.columns}
 
     def __init__(self, num_layer: int, num_step: int, step_size: float, forward_type: int, hyper_params: pd.DataFrame=hyper_params_, device: str="cuda"):
         super(MNIST_Network, self).__init__()
@@ -50,7 +50,7 @@ class MNIST_Network(nn.Module):
         self.device = device
 
         init_configs = {"num_step": self.num_step, "step_size": self.step_size, "forward_type": self.forward_type, "device": self.device}
-        global DiscretizeForward
+        global DiscretizeForward, SpikeCountLoss
         DiscretizeForward = param(DiscretizeForward, init_configs)
         
         assert num_layer == hyper_params.shape[0]
@@ -59,11 +59,15 @@ class MNIST_Network(nn.Module):
         prv_num_neuron = None
         for layer_idx in range(num_layer):
             layer_config: Dict = MNIST_Network._layer_config(hyper_params, layer_idx)
+            if layer_idx == num_layer - 1:
+                SpikeCountLoss = param(SpikeCountLoss, MNIST_Network._layer_config(hyper_params, layer_idx, add_idx=False))
+                setattr(SpikeCountLoss, "step_size", step_size)
+                setattr(SpikeCountLoss, "device", device)
             num_neuron_ = f"num_neuron__{layer_idx}"
             num_neuron = layer_config[num_neuron_]
             del layer_config[num_neuron_]
             if prv_num_neuron is None: prv_num_neuron = num_neuron
-            cur_layer: LIF_Layer = LIF_Layer(layer_idx, num_neuron, prv_num_neuron, layer_config, (lambda dim1, dim2: 2 * torch.rand((dim1, dim2)) - 1) if layer_idx != 0 else (lambda dim1, dim2: torch.ones((dim1, dim2))), self.device)
+            cur_layer: LIF_Layer = LIF_Layer(layer_idx, num_neuron, prv_num_neuron, layer_config, (lambda dim1, dim2: 2 * torch.rand((dim1, dim2)) - 1), self.device)
             self.layers.append(cur_layer)
             prv_num_neuron = num_neuron
 
@@ -76,11 +80,15 @@ class MNIST_Network(nn.Module):
         assert input_spikes_.shape[1] == self.num_step
         p_spikes: torch.Tensor = input_spikes_.to(self.device).type(torch.float32)
         p_voltage: torch.Tensor = torch.ones_like(p_spikes).to(self.device)
-        
+        p_current: torch.Tensor = None
+
         for layer in self.layers:
-            p_voltage, p_spikes = layer(p_voltage, p_spikes)
+            p_voltage, p_current, p_spikes = layer(p_voltage, p_spikes)
         
-        return p_voltage, p_spikes
+        return p_voltage, p_current, p_spikes
+    
+    def get_weights(self, idx: int):
+        return self.layers[idx].weights.data
         
         
         

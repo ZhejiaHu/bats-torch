@@ -186,8 +186,25 @@ class VectorTest:
                         ans_[b, step, cur_step, n] = ans_[b, step, nxt[b, step, n], n] * pu_pt_ * torch.clamp(1 / du_dt_, min=-8, max=8)
                     if output_spikes[b, cur_step, n] == 1: nxt[b, step, n] = torch.min(nxt[b, step, n], torch.tensor(cur_step))
                 assert torch.allclose(ans_, res_) 
+        elif func_name == "_reduce_pe_pu":
+            for it in range(self.num_iter):
+                print(it)
+                pe_pu: torch.Tensor = torch.rand((self.batch_size, self.num_step, self.num_step, self.num_neuron_cur))
+                shape_: Tuple = self.state_shape_cur
+                res_: torch.Tensor = func(pe_pu, self.step_size, self.tau_m)
+                assert res_.shape == shape_
 
-    
+                ans_: torch.Tensor = torch.zeros(shape_)
+                du_nxt_du = self.tau_m / (self.step_size + self.tau_m)
+                for b, n in product(range(self.batch_size), range(self.num_neuron_cur)):
+                    ans_[b, -1, n] = pe_pu[b, -1, -1, n]
+                for t_prv in range(self.num_step - 2, -1, -1):
+                    for b, n in product(range(self.batch_size), range(self.num_neuron_cur)):
+                        ans_[b, t_prv, n] = du_nxt_du * ans_[b, t_prv + 1, n]
+                        for t_nxt in range(t_prv, self.num_step):
+                            ans_[b, t_prv, n] += pe_pu[b, t_nxt, t_prv, n]
+                assert torch.allclose(ans_, res_)
+
 
 """
 Repetitive testing on one dataset. 

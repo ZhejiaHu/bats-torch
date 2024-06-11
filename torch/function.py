@@ -157,6 +157,20 @@ class DiscretizeForward(torch.autograd.Function):
         pe_pu_: torch.Tensor = torch.einsum("bnxy,bny->bxy", pu_pw_, grad_u)
         return torch.mean(pe_pu_, dim=0)
     
+
+
+    """
+    Parameters:
+    - recur_di: (batch_size, num_step, num_neuron_cur)
+    - weights: (num_neuron_pre, num_neuron_cur)
+    - prv_spikes: (batch_size, num_step, num_neuron_prv)
+    
+    """
+    @staticmethod
+    def _pe_pw_i(recur_di: torch.Tensor, weights: torch.Tensor, prv_spikes: torch.Tensor, step_size: float, tau_s: float) -> torch.Tensor:
+        coeff: float = step_size / (tau_s + step_size)
+        pi_pw_: torch.Tensor = coeff * torch.einsum("bnx,bny->bnxy", prv_spikes, recur_di)
+        return torch.mean(pi_pw_, dim=(0, 1))
     
     
     """
@@ -291,7 +305,6 @@ class DiscretizeForward(torch.autograd.Function):
         layer_idx = ctx.layer_idx
         prv_voltage, prv_spikes, cur_state, cur_spikes, weights, cur_du_di = ctx.saved_tensors      
         bias: torch.Tensor = torch.einsum("bnx,xy->bny", prv_spikes, weights)
-
         batch_size, num_step, num_neuron_cur = cur_grad_voltage_.shape
         num_neuron_prv = prv_spikes.shape[-1]
 
@@ -302,15 +315,18 @@ class DiscretizeForward(torch.autograd.Function):
         cur_reset: float        = getattr(DiscretizeForward, f"reset__{layer_idx}")
         cur_threshold: float    = getattr(DiscretizeForward, f"threshold__{layer_idx}")
         cur_grad_voltage: torch.Tensor = torch.cat((cur_grad_voltage_, torch.zeros((batch_size, 1, num_neuron_cur), device=DiscretizeForward._device())), dim=1)                                                                                                                                                   # (batch_size, num_step + 1, num_neuron_cur)
-        grad_weights: torch.Tensor = DiscretizeForward._pe_pw(prv_spikes, weights, cur_grad_voltage, step_size, cur_resistance, cur_tau_m, cur_tau_s)
+        recur_di: torch.Tensor = DiscretizeForward._recur_di(cur_state, cur_grad_voltage_, bias, step_size, cur_resistance, cur_tau_m, cur_tau_s, cur_reset, cur_threshold)
+        grad_weights: torch.Tensor = None
+        if hasattr(DiscretizeForward, "discretize_grad_weight") and getattr(DiscretizeForward, "discretize_grad_weight") is True:
+            grad_weights = DiscretizeForward._pe_pw_i(recur_di, weights, prv_spikes, step_size, cur_tau_s)
+        else: grad_weights = DiscretizeForward._pe_pw(prv_spikes, weights, cur_grad_voltage, step_size, cur_resistance, cur_tau_m, cur_tau_s)
         DiscretizeForward._assert("grad_weights", grad_weights)
         if layer_idx == 0: return None, None, -grad_weights
         
-        with DiscretizeForward.du_dt_dict_lock:
-            prv_du_dt: torch.Tensor = DiscretizeForward.du_dt_dict[layer_idx - 1]
-        recur_di: torch.Tensor = DiscretizeForward._recur_di(cur_state, cur_grad_voltage_, bias, step_size, cur_resistance, cur_tau_m, cur_tau_s, cur_reset, cur_threshold)
         prv_tau_m: float        = getattr(DiscretizeForward, f"tau_m__{layer_idx - 1}")
         prv_reset: float        = getattr(DiscretizeForward, f"reset__{layer_idx - 1}")
+        with DiscretizeForward.du_dt_dict_lock:
+            prv_du_dt: torch.Tensor = DiscretizeForward.du_dt_dict[layer_idx - 1]
         pi_pu: torch.Tensor = DiscretizeForward._pi_pu(batch_size, num_step, num_neuron_cur, num_neuron_prv, step_size, cur_tau_s, prv_tau_m, prv_reset, 
                                                        prv_spikes, weights, prv_du_dt)
         grad_voltage_prv = DiscretizeForward._recur_du(recur_di, pi_pu[:, :-1, :-1], step_size, prv_tau_m)
@@ -366,7 +382,25 @@ class SpikeCountLoss(torch.autograd.Function):
         return pe_pu
     
 
-            
+    """
+    Parameters:
+    - pe_pu: (batch_size, num_step, num_step, num_neuron)
+
+    Returns: (batch_size, num_step, num_neuron)    
+    """
+    @staticmethod 
+    def _reduce_pe_pu(pe_pu: torch.Tensor, step_size: float, tau_m: float) -> torch.Tensor:
+        batch_size, num_step, _, num_neuron = pe_pu.shape 
+        grad_u: torch.Tensor = torch.zeros((batch_size, num_step, num_neuron)).to(SpikeCountLoss.device)
+        grad_u[:, -1] = pe_pu[:, -1, -1]
+        du_nxt_du = tau_m / (tau_m + step_size)
+        for prv_step in range(num_step - 2, -1, -1):
+            grad_u[:, prv_step] = grad_u[:, prv_step + 1] * du_nxt_du
+            for nxt_step in range(prv_step, num_step):
+                grad_u[:, prv_step] += pe_pu[:, nxt_step, prv_step]
+        return grad_u  
+
+
 
     """
     Notes:
@@ -397,7 +431,7 @@ class SpikeCountLoss(torch.autograd.Function):
         diff_cnt_: torch.Tensor = (target_spikes - output_spikes_cnt)  / num_step
         diff_cnt_masked: torch.Tensor = diff_cnt_.unsqueeze(1).repeat(1, num_step, 1)
         pe_pu: torch.Tensor = SpikeCountLoss._pe_pu(diff_cnt_masked, output_voltage, output_current, output_spikes, SpikeCountLoss.step_size, SpikeCountLoss.tau_m, SpikeCountLoss.resistance, SpikeCountLoss.threshold, SpikeCountLoss.reset)
-        return pe_pu.sum(dim=1), None, None, None 
+        return SpikeCountLoss._reduce_pe_pu(pe_pu, SpikeCountLoss.step_size, SpikeCountLoss.tau_m), None, None, None 
     
 
     """

@@ -1,73 +1,120 @@
-from experiments.mnist.Dataset import Dataset as MNIST_Dataset
+import datetime
 from function import DiscretizeForward, SpikeCountLoss
+from itertools import product
 from network import MNIST_Network
 import numpy as np
-from itertools import product
 import random 
-from test import learning_test
+from snntorch import spikegen
 import torch
 import torch.nn as nn
-from torch.optim import Adam
-from typing import Dict, Tuple
-  
+from torch.optim import Adam, Optimizer
+from torch.optim.lr_scheduler import ReduceLROnPlateau, LRScheduler
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+from typing import Callable, Dict, Tuple
 
-def mnist_train(num_layer: int, num_step: int, step_size: float, forward_type: int, hyper_params: Dict, device: str="cuda", pre_test: bool=False, pre_train_num: int=3, pre_test_num: int=3):
 
-    MNIST_DATASET_PTH: str = "../datasets/mnist.npz"
+def save_checkpoint(state: Dict, epoch: int, is_best: bool, filename_: str) -> None:
+    torch.save(state, filename_ + f"_lastest_{epoch}.pth.tar")
+    if is_best:
+        torch.save(state, filename_ + f"_best_{epoch}.pth.tar")
+
+
+def load_checkpoint(filename: str) -> Tuple[nn.Module, Optimizer, LRScheduler, Dict]:
+    checkpoint = torch.load(filename)
+    network = MNIST_Network(checkpoint["num_layer"], checkpoint["num_step"], checkpoint["step_size"], checkpoint["forward_type"], checkpoint["hyper_params"])
+    network.load_state_dict(checkpoint["state_dict"])
+    optimizer = Adam(network.parameters(), lr=1e-3)
+    optimizer.load_state_dict(checkpoint["optimizer"])
+    scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=10)
+    scheduler.load_state_dict(checkpoint["scheduler"])
+    return network, optimizer, scheduler, checkpoint
+
+
+def mnist_train(num_layer: int, num_step: int, step_size: float, forward_type: int, hyper_params: Dict, device: str="cuda", encoder="amplitude", load_filename=None):
+    DATASET_NAME = "MNIST"
+
+    MNIST__DATASET_TRAIN_PTH: str = "datasets/mnist/train"
+    MNIST__DATASET_TEST_PTH: str = "datasets/mnist/test"
     MNIST__NUM_CLASSES: int = 10
-    MNIST__LEARNING_RATE: float = 0.01
     MNIST__TRAIN_EPOCHS: int = 50
     MNIST__NUM_TRAIN_SAMPLES = 60000
     MNIST__NUM_TEST_SAMPLES = 10000
-    MNIST__TRAIN_BATCH_SIZE: int = 5
+    MNIST__TRAIN_BATCH_SIZE: int = 50
     MNIST__NUM_TRAIN_BATCH = int(MNIST__NUM_TRAIN_SAMPLES / MNIST__TRAIN_BATCH_SIZE)
-    MNIST__TEST_BATCH_SIZE: int = 10
-    MNIST__NUM_TEST_BATCH = int(MNIST__NUM_TEST_SAMPLES / MNIST__TEST_BATCH_SIZE) 
-    MNIST__TEST_PERIOD = 3 
-    MNIST__TARGET_TRUE = 15
-    MNIST__TARGET_FALSE = 3
+    MNIST__TEST_BATCH_SIZE: int = 100
+    MNIST__TEST_PERIOD = int(MNIST__NUM_TRAIN_BATCH * 0.1)
+    MNIST__TARGET_TRUE = num_step - 5
+    MNIST__TARGET_FALSE = 0
 
     """
-    Returns:
-    - ipt_spikes: (batch_size, num_step, num_neuron)
-    - labels: (batch_size, )
-    - tgt_spikes_: (batch_size, num_class)
+    Convert from snntorch spike shape to our spike shape
+    - Input (num_step, batch_size, 1, 28, 28)
+    - Output (batch_step, num_step, 28 * 28)
     """
-    def mnist_get_batch(train: bool, dataset: MNIST_Dataset, batch_idx: int, batch_size: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        spikes_, _, labels_ = dataset.get_train_batch(batch_idx, batch_size) if train else dataset.get_test_batch(batch_idx, batch_size)
-        batch_size, num_neuron = spikes_.shape[:-1]
-        spikes_ = (spikes_.squeeze(-1) / np.max(spikes_) * (num_step - 1)).astype(int)
-        spikes_ = num_step - 1 - spikes_
-        spikes = np.zeros((batch_size, num_step, num_neuron))
-        for b, n in product(range(batch_size), range(num_neuron)):
-            spikes[b, :spikes_[b, n], n] = 1
-        tgt_spikes_: np.ndarray = np.full((batch_size, MNIST__NUM_CLASSES), MNIST__TARGET_FALSE)
-        tgt_spikes_[np.arange(batch_size), labels_] = MNIST__TARGET_TRUE
-        return torch.from_numpy(spikes).to(device), torch.from_numpy(labels_).to(device), torch.from_numpy(tgt_spikes_).to(device) 
+    _convert: Callable = lambda raw_spike, batch_size: raw_spike.squeeze(2).transpose(0, 1).reshape(batch_size, num_step, -1)
+    
+    """
+    Parameters:
+    - labels: (batch_size,)
+    """
+    def _gen_ipt_spikes(data: torch.Tensor) -> torch.Tensor:
+        batch_size, num_neuron = data.shape[0], data.shape[-2] * data.shape[-1] 
+        if encoder == "amplitude":
+            data_ = (data.squeeze(1).reshape(batch_size, -1) * (num_step - 1)).to(torch.int32)
+            spikes = torch.zeros((batch_size, num_step, num_neuron))
+            for b, n in product(range(batch_size), range(num_neuron)):
+                spikes[b, :data_[b, n], n] = 1
+            return spikes
+        elif encoder == "rate": return _convert(spikegen.rate(data, num_steps=num_step), batch_size)
+        else: return _convert(spikegen.latency(data, num_steps=num_step, normalize=True), batch_size)
+                                                
 
-    dataset = MNIST_Dataset(MNIST_DATASET_PTH)
-    network = MNIST_Network(num_layer, num_step, step_size, forward_type, hyper_params, device)
-    optimizer = Adam(network.parameters(), lr=MNIST__LEARNING_RATE)
+
+    def _gen_label_spikes(batch_size: int, labels: torch.Tensor) -> torch.Tensor:
+        tgt_spikes: np.ndarray = np.full((batch_size, MNIST__NUM_CLASSES), MNIST__TARGET_FALSE)
+        tgt_spikes[np.arange(batch_size), labels] = MNIST__TARGET_TRUE
+        return torch.from_numpy(tgt_spikes)
+
+
+    def _load_data(transform: transforms.Compose=transforms.Compose([
+        transforms.Resize((28,28)),
+        transforms.Grayscale(),
+        transforms.ToTensor(),
+        transforms.Normalize((0,), (1,))])
+    ):
+        mnist_train = datasets.MNIST(MNIST__DATASET_TRAIN_PTH, train=True, download=True, transform=transform)
+        mnist_test = datasets.MNIST(MNIST__DATASET_TEST_PTH, train=False, download=True, transform=transform)
+        return DataLoader(mnist_train, batch_size=MNIST__TRAIN_BATCH_SIZE, shuffle=True), DataLoader(mnist_test, batch_size=MNIST__TEST_BATCH_SIZE)
+
     
-    if pre_test:
-        train_idxs = np.random.randint(0, MNIST__TRAIN_BATCH_SIZE, pre_train_num)
-        test_idxs = np.random.randint(0, MNIST__TEST_BATCH_SIZE, pre_test_num)
-        train_batches = list(map(lambda idx: mnist_get_batch(True, dataset, idx, MNIST__TRAIN_BATCH_SIZE), train_idxs))
-        test_batches = list(map(lambda idx: mnist_get_batch(False, dataset, idx, MNIST__TEST_BATCH_SIZE), test_idxs))
-        print(f"[Pre-test] Train indices : {train_idxs} | Test indices : {test_idxs}")
-        learning_test(network, MNIST__TRAIN_BATCH_SIZE, MNIST__TEST_BATCH_SIZE, train_batches, test_batches)
+    def _store_state(model: nn.Module, optimizer: Optimizer, scheduler: LRScheduler, epoch: int, is_best: bool=False) -> Dict:
+        state: Dict = {
+            "dataset": DATASET_NAME, "epoch": epoch, "state_dict": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+            "num_layer": num_layer, "num_step": num_step, "step_size": step_size, "forward_type": forward_type, "hyper_params": hyper_params, "encoder" : encoder, "target_true": MNIST__TARGET_TRUE, "target_false": MNIST__TARGET_FALSE
+        }
+        now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename_: str = f"{DATASET_NAME}__{now}__EPOCH_{epoch}"
+        save_checkpoint(state, epoch, is_best, filename_)        
+
+    train_loader, test_loader = _load_data()
+    if load_filename is None:
+        network = MNIST_Network(num_layer, num_step, step_size, forward_type, hyper_params, device) 
+        optimizer = Adam(network.parameters(), lr=1e-3)
+        scheduler = ReduceLROnPlateau(optimizer, mode="min", factor=0.1, patience=10)
+    else: 
+        network, optimizer, scheduler, checkpoint = load_checkpoint(load_filename)
+        MNIST__TARGET_TRUE, MNIST__TARGET_FALSE = checkpoint["target_true"], checkpoint["target_false"]
     
-    network = MNIST_Network(num_layer, num_step, step_size, forward_type, hyper_params, device)
-    optimizer = Adam(network.parameters(), lr=MNIST__LEARNING_RATE)
     for epoch in range(MNIST__TRAIN_EPOCHS):
         network.train()
-        dataset.shuffle()
         num_correct = 0
         losses = 0
-
-        for batch_idx in range(MNIST__NUM_TRAIN_BATCH):
+        for batch_idx, (data, labels) in enumerate(train_loader):
             optimizer.zero_grad()
-            ipt_spikes, labels, tgt_spikes = mnist_get_batch(True, dataset, batch_idx, MNIST__TRAIN_BATCH_SIZE)
+            tgt_spikes = _gen_label_spikes(MNIST__TRAIN_BATCH_SIZE, labels).to(device).to(torch.float32)
+            ipt_spikes = _gen_ipt_spikes(data).to(device).to(torch.float32)
+            labels = labels.to(device).to(torch.uint8)
             opt_voltage, opt_current, opt_spikes = network(ipt_spikes)
             loss = SpikeCountLoss.apply(opt_voltage, opt_current, opt_spikes, tgt_spikes)
             num_correct += SpikeCountLoss.accuracy(opt_spikes, labels) 
@@ -75,20 +122,27 @@ def mnist_train(num_layer: int, num_step: int, step_size: float, forward_type: i
             optimizer.step()
             losses += loss.item()
 
-            if batch_idx > 0 and batch_idx % MNIST__TEST_PERIOD == 0:
-                print(f"[TRAIN] Epoch {epoch} --- has losses {losses} and number of correct predictions {num_correct} and accuracy rate : {num_correct / ((batch_idx + 1) * MNIST__TRAIN_BATCH_SIZE)}")
+            if (batch_idx > 0 or epoch > 0) and batch_idx % MNIST__TEST_PERIOD == 0:
+                if batch_idx == 0: scheduler.step(loss)
+                print(f"[TRAIN] Epoch {epoch} --- has losses {losses} and number of correct predictions {num_correct} and accuracy rate : {num_correct / (MNIST__TEST_PERIOD * MNIST__TRAIN_BATCH_SIZE)}")
                 network.eval()
-                num_correct_ = 0
-                losses_ = 0
+                num_correct = 0
+                losses = 0
                 with torch.no_grad():
-                    for batch_idx in range(MNIST__NUM_TEST_BATCH):
-                        ipt_spikes, labels, tgt_spikes = mnist_get_batch(False, dataset, batch_idx, MNIST__TEST_BATCH_SIZE)
-                        opt_voltage, opt_current, opt_spikes = network(ipt_spikes)
-                        losses_ += SpikeCountLoss.apply(opt_voltage, opt_current, opt_spikes, tgt_spikes).item()
-                        num_correct_ += SpikeCountLoss.accuracy(opt_spikes, labels)
+                    num_correct_ = 0
+                    losses_ = 0
+                    for batch_idx_, (data_, labels_) in enumerate(test_loader):
+                        tgt_spikes_ = _gen_label_spikes(MNIST__TEST_BATCH_SIZE, labels_).to(device).to(torch.float32)
+                        ipt_spikes_ = _gen_ipt_spikes(data_).to(device).to(torch.float32)
+                        labels_ = labels_.to(device).to(torch.uint8)
+                        opt_voltage_, opt_current_, opt_spikes_ = network(ipt_spikes_)
+                        losses_ += SpikeCountLoss.apply(opt_voltage_, opt_current_, opt_spikes_, tgt_spikes_).item()
+                        num_correct_ += SpikeCountLoss.accuracy(opt_spikes_, labels_)
                 print(f"    [TEST] Epoch {epoch} --- has losses {losses_} and number of correct predictions {num_correct_} and accuracy rate : {num_correct_ / MNIST__NUM_TEST_SAMPLES}")
-    
-
+        
+        _store_state(network, optimizer, scheduler, epoch, is_best=False)
+            
+        
 
 
 

@@ -1,5 +1,6 @@
 import threading
 import torch
+import torch.nn.functional as F
 from typing import Callable, Dict, Tuple
 
 BIG_NUMBER = 1e6
@@ -31,7 +32,7 @@ class DiscretizeForward(torch.autograd.Function):
     
     
     @staticmethod
-    def _inv_du_dt(du_dt: torch.Tensor, scale: int=8):
+    def _inv_du_dt(du_dt: torch.Tensor, scale: int=50000):
         inv_du_dt: torch.Tensor = 1 / du_dt
         return torch.clamp(inv_du_dt, min=-scale, max=scale)
 
@@ -197,7 +198,7 @@ class DiscretizeForward(torch.autograd.Function):
             pu_pt_: torch.Tensor = torch.gather(pu_pt__.unsqueeze(2).repeat(1, 1, num_neuron_cur, 1), 1, last_spikes)                     
             pu_pu_: torch.Tensor = torch.einsum("bnxy,by->bnxy", pu_pt_, DiscretizeForward._inv_du_dt(du_dt_))                                                                                                                                                               
             pi_pu__: torch.Tensor = torch.gather(pi_pu, 2, last_spikes.view(batch_size, num_step + 1, 1, num_neuron_cur, num_neuron_prv)).squeeze(2)                       
-            pi_pu[:, :, prv_step] = pi_pu_ + torch.where(torch.logical_and(cur_steps != prv_step, prv_step != last_spikes),  pi_pu__ * pu_pu_, 0)
+            pi_pu[:, :, prv_step] = pi_pu_ + torch.where(torch.logical_and(cur_steps != prv_step, cur_steps != last_spikes),  pi_pu__ * pu_pu_, 0)
             last_spikes = torch.where(prv_spikes[:, prv_step].view(batch_size, 1, 1, num_neuron_prv).expand(batch_size, num_step + 1, num_neuron_cur, num_neuron_prv) == 1, torch.min(last_spikes, torch.tensor(prv_step)), last_spikes)
         return pi_pu
     
@@ -352,7 +353,7 @@ class SpikeCountLoss(torch.autograd.Function):
         return (reset / (tau_m ** 2) * torch.exp(-(times - cur_time) / tau_m)) * spikes[:, cur_step].unsqueeze(1).expand(batch_size, num_step, num_neuron) * (times_ >= cur_step)
     
     @staticmethod
-    def _inv_du_dt(du_dt: torch.Tensor, scale: int=8):
+    def _inv_du_dt(du_dt: torch.Tensor, scale: int=10000):
         inv_du_dt: torch.Tensor = 1 / du_dt
         return torch.clamp(inv_du_dt, min=-scale, max=scale)
 
@@ -406,8 +407,8 @@ class SpikeCountLoss(torch.autograd.Function):
     Notes:
     - num_class == num_neuron
     Parameters:
-    - output_spikes: (batch_size, num_step, num_class) 
-    - target_spikes: (batch_size, num_class) 
+    - output_spikes: (batch_size, num_step, num_class)
+    - target_spikes: (batch_size, num_class)
     """
     @staticmethod
     def forward(ctx, output_voltage: torch.Tensor, output_current: torch.Tensor, output_spikes: torch.Tensor, target_spikes: torch.Tensor) -> float:
@@ -415,7 +416,7 @@ class SpikeCountLoss(torch.autograd.Function):
         output_spikes_cnt: torch.Tensor = torch.sum(output_spikes, dim=1)
         ctx.save_for_backward(output_voltage, output_current, output_spikes, target_spikes)
         return torch.sum((output_spikes_cnt - target_spikes) ** 2, dim=(0, 1)) / batch_size
-    
+
 
     """
     Returns: (batch_size, num_step + 1, num_class)
@@ -431,7 +432,7 @@ class SpikeCountLoss(torch.autograd.Function):
         diff_cnt_: torch.Tensor = (target_spikes - output_spikes_cnt)  / num_step
         diff_cnt_masked: torch.Tensor = diff_cnt_.unsqueeze(1).repeat(1, num_step, 1)
         pe_pu: torch.Tensor = SpikeCountLoss._pe_pu(diff_cnt_masked, output_voltage, output_current, output_spikes, SpikeCountLoss.step_size, SpikeCountLoss.tau_m, SpikeCountLoss.resistance, SpikeCountLoss.threshold, SpikeCountLoss.reset)
-        return SpikeCountLoss._reduce_pe_pu(pe_pu, SpikeCountLoss.step_size, SpikeCountLoss.tau_m), None, None, None 
+        return SpikeCountLoss._reduce_pe_pu(pe_pu, SpikeCountLoss.step_size, SpikeCountLoss.tau_m), None, None, None
     
 
     """

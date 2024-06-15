@@ -1,20 +1,11 @@
+import numpy as np
 import pandas as pd
 import torch 
 import torch.nn as nn
+from torch.optim import Adam, Optimizer
 from typing import Callable, Dict, List, Tuple
 
 from function import param, DiscretizeForward, SpikeCountLoss
-
-hyper_params_: pd.DataFrame = pd.DataFrame({
-    "num_neuron": [28 * 28, 800, 10],
-    "tau_m": [0.07, 0.06, 0.05],
-    "tau_s": [0.05, 0.04, 0.03],
-    "resistance": [0.8, 1, 1.2],
-    "threshold": [1.2, 1, 0.8],
-    "reset": [0.5, 0.4, 0.3]
-}, index=[0, 1, 2])
-
-
 
 
 class LIF_Layer(nn.Module):
@@ -41,7 +32,7 @@ class MNIST_Network(nn.Module):
     def _layer_config(params: pd.DataFrame, layer_idx: int, add_idx: bool=True) -> Dict:
         return {col + (f"__{layer_idx}" if add_idx else ""): params.loc[layer_idx, col] for col in params.columns}
 
-    def __init__(self, num_layer: int, num_step: int, step_size: float, forward_type: int, hyper_params: pd.DataFrame=hyper_params_, device: str="cuda"):
+    def __init__(self, num_layer: int, num_step: int, step_size: float, forward_type: int, hyper_params: pd.DataFrame, device: str="cuda"):
         super(MNIST_Network, self).__init__()
         self.num_layer = num_layer
         self.num_step = num_step
@@ -90,7 +81,15 @@ class MNIST_Network(nn.Module):
     def get_weights(self, idx: int):
         return self.layers[idx].weights.data
         
-        
-        
-    
+permutate_weight: Callable = lambda weights: weights[np.lexsort(weights.transpose(), axis=0)]
 
+
+def convert_to_linear_ann(network: MNIST_Network) -> Tuple[nn.Module, Optimizer]:
+    linear_ann: nn.Module = nn.Sequential(nn.Flatten())
+    for i in range(network.num_layer):
+        linear_ann.append(nn.Linear(network.get_weights(i).shape[0], network.get_weights(i).shape[1]))
+        if i < network.num_layer - 1: linear_ann.append(nn.ReLU())
+    optimizer = Adam(linear_ann.parameters(), lr=0.001)
+    return linear_ann, optimizer 
+    
+    

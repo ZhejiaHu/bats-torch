@@ -121,7 +121,7 @@ class VectorTest:
                     du_dt = prv_du_dt[b, t_p, n_p]
                     pi_pu = pi_pt / du_dt
                     ans_[b][t_c][t_p][n_c][n_p] = pi_pu
-                    if t_c != t_p and last_spikes[b][t_c][n_c][n_p] != t_p:
+                    if t_c != t_p and last_spikes[b][t_c][n_c][n_p] != t_c:
                         last_spike = last_spikes[b][t_c][n_c][n_p]
                         pu_pt = prv_reset / (prv_tau_m ** 2) * np.exp(- (last_spike * self.step_size - t_p_) / prv_tau_m)
                         ans_[b][t_c][t_p][n_c][n_p] += ans_[b][t_c][last_spike][n_c][n_p] * pu_pt / du_dt

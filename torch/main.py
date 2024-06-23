@@ -1,3 +1,4 @@
+from copy import deepcopy
 import datetime
 from function import DiscretizeForward, SpikeCountLoss
 from itertools import product
@@ -11,7 +12,7 @@ from torch.optim import Adam, Optimizer
 from torch.optim.lr_scheduler import ReduceLROnPlateau, LRScheduler
 from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-from typing import Callable, Dict, Tuple
+from typing import Callable, Dict, List, Tuple
 
 
 def save_checkpoint(state: Dict, epoch: int, is_best: bool, filename_: str) -> None:
@@ -63,8 +64,12 @@ def mnist_train(num_layer: int, num_step: int, step_size: float, forward_type: i
         if encoder == "amplitude":
             data_ = (data.squeeze(1).reshape(batch_size, -1) * (num_step - 1)).to(torch.int32)
             spikes = torch.zeros((batch_size, num_step, num_neuron))
-            for b, n in product(range(batch_size), range(num_neuron)):
-                spikes[b, :data_[b, n], n] = 1
+            mid = torch.arange(num_step).unsqueeze(0).unsqueeze(-1).repeat(batch_size, 1, num_neuron)
+            spikes = torch.where(mid <= data_.view(batch_size, 1, num_neuron).expand(batch_size, num_step, num_neuron), 1, 0)
+            #spikes_ = torch.zeros((batch_size, num_step, num_neuron))
+            #for b, n in product(range(batch_size), range(num_neuron)):
+            #    spikes_[b, :data_[b, n]+1, n] = 1
+            #assert torch.allclose(spikes.to(torch.float32), spikes_.to(torch.float32))
             return spikes
         elif encoder == "rate": return _convert(spikegen.rate(data, num_steps=num_step), batch_size)
         else: return _convert(spikegen.latency(data, num_steps=num_step, normalize=True), batch_size)
@@ -88,14 +93,28 @@ def mnist_train(num_layer: int, num_step: int, step_size: float, forward_type: i
         return DataLoader(mnist_train, batch_size=MNIST__TRAIN_BATCH_SIZE, shuffle=True), DataLoader(mnist_test, batch_size=MNIST__TEST_BATCH_SIZE)
 
     
-    def _store_state(model: nn.Module, optimizer: Optimizer, scheduler: LRScheduler, epoch: int, is_best: bool=False) -> Dict:
+    def _store_state(model: nn.Module, optimizer: Optimizer, scheduler: LRScheduler, epoch: int, log: List[Tuple], is_best: bool=False) -> Dict:
         state: Dict = {
             "dataset": DATASET_NAME, "epoch": epoch, "state_dict": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
-            "num_layer": num_layer, "num_step": num_step, "step_size": step_size, "forward_type": forward_type, "hyper_params": hyper_params, "encoder" : encoder, "target_true": MNIST__TARGET_TRUE, "target_false": MNIST__TARGET_FALSE
+            "num_layer": num_layer, "num_step": num_step, "step_size": step_size, "forward_type": forward_type, "hyper_params": hyper_params, "encoder" : encoder, "target_true": MNIST__TARGET_TRUE, "target_false": MNIST__TARGET_FALSE,
+            "log": log
         }
         now = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         filename_: str = f"{DATASET_NAME}__{now}__EPOCH_{epoch}"
-        save_checkpoint(state, epoch, is_best, filename_)        
+        save_checkpoint(state, epoch, is_best, filename_)   
+
+
+    def _phase_plane(labels: torch.Tensor, opt_voltage: torch.Tensor, opt_current: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        batch_size, num_step, num_class = opt_voltage.shape
+        opt_v_c_glob, opt_i_c_glob, opt_v_w_glob, opt_i_w_glob = torch.zeros(num_step), torch.zeros(num_step), torch.zeros(num_step), torch.zeros(num_step)
+        for batch_idx in range(batch_size):
+            label  = labels[batch_idx].item()
+            opt_v, opt_i = opt_voltage[batch_idx], opt_current[batch_idx]
+            opt_v_c, opt_i_c = opt_v[:, label], opt_i[:, label]
+            opt_v_w, opt_i_w = opt_v[:, [i for i in range(num_class) if i != label]].mean(dim=1), opt_i[:, [i for i in range(num_class) if i != label]].mean(dim=1)
+            opt_v_c_glob += opt_v_c; opt_i_c_glob += opt_i_c; opt_v_w_glob += opt_v_w; opt_i_w_glob += opt_i_w
+        return opt_v_c_glob / batch_size, opt_i_c_glob / batch_size, opt_v_w_glob / batch_size, opt_i_w_glob / batch_size
+        
 
     train_loader, test_loader = _load_data()
     if load_filename is None:
@@ -106,10 +125,15 @@ def mnist_train(num_layer: int, num_step: int, step_size: float, forward_type: i
         network, optimizer, scheduler, checkpoint = load_checkpoint(load_filename)
         MNIST__TARGET_TRUE, MNIST__TARGET_FALSE = checkpoint["target_true"], checkpoint["target_false"]
     
+    # Tuple[Training Loss, Training Accuracy, Testing Loss, Testing Accuracy] 
+    log: List[Tuple[float, float, float, float]] = []
+
+
     for epoch in range(MNIST__TRAIN_EPOCHS):
         network.train()
         num_correct = 0
         losses = 0
+
         for batch_idx, (data, labels) in enumerate(train_loader):
             optimizer.zero_grad()
             tgt_spikes = _gen_label_spikes(MNIST__TRAIN_BATCH_SIZE, labels).to(device).to(torch.float32)
@@ -125,7 +149,10 @@ def mnist_train(num_layer: int, num_step: int, step_size: float, forward_type: i
             if (batch_idx > 0 or epoch > 0) and batch_idx % MNIST__TEST_PERIOD == 0:
                 if batch_idx == 0: scheduler.step(loss)
                 print(f"[TRAIN] Epoch {epoch} --- has losses {losses} and number of correct predictions {num_correct} and accuracy rate : {num_correct / (MNIST__TEST_PERIOD * MNIST__TRAIN_BATCH_SIZE)}")
+                opt_v_c, opt_i_c, opt_v_w, opt_i_w = _phase_plane(labels.detach().cpu(), opt_voltage.detach().cpu(), opt_current.detach().cpu())
+                
                 network.eval()
+                cur_log = [deepcopy(losses), deepcopy(num_correct)]
                 num_correct = 0
                 losses = 0
                 with torch.no_grad():
@@ -138,9 +165,12 @@ def mnist_train(num_layer: int, num_step: int, step_size: float, forward_type: i
                         opt_voltage_, opt_current_, opt_spikes_ = network(ipt_spikes_)
                         losses_ += SpikeCountLoss.apply(opt_voltage_, opt_current_, opt_spikes_, tgt_spikes_).item()
                         num_correct_ += SpikeCountLoss.accuracy(opt_spikes_, labels_)
+                cur_log.append(deepcopy(losses_))
+                cur_log.append(deepcopy(num_correct_))
+                log.append(tuple(cur_log))
                 print(f"    [TEST] Epoch {epoch} --- has losses {losses_} and number of correct predictions {num_correct_} and accuracy rate : {num_correct_ / MNIST__NUM_TEST_SAMPLES}")
         
-        _store_state(network, optimizer, scheduler, epoch, is_best=False)
+        _store_state(network, optimizer, scheduler, epoch, log, is_best=False)
             
         
 

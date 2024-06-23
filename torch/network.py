@@ -9,12 +9,13 @@ from function import param, DiscretizeForward, SpikeCountLoss
 
 
 class LIF_Layer(nn.Module):
-    def __init__(self, layer_idx: int, dim: int, prv_dim: int, prms: Dict, weight_init: Callable, device: str="cuda"):
+    def __init__(self, layer_idx: int, dim: int, prv_dim: int, prms: Dict, weight_init: Callable, device: str="cuda", kaiming: bool=True):
         super(LIF_Layer, self).__init__()
         self.layer_idx = layer_idx
         self.dim = dim
         self.prms = prms
         self.weights = nn.Parameter(weight_init(prv_dim, dim).to(device))
+        if kaiming: nn.init.kaiming_normal_(self.weights)
     
     """
     Parameters:
